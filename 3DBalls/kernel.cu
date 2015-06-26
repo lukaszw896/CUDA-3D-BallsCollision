@@ -7,23 +7,36 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-#define N  500
+#define N  2000
+#define GRAVITY 0.01
+#define SPRINGINESS 0.95
+#define RADIUS 0.01
+
+int refreshMillis = 35;
 
 GLdouble eyeX = 0, eyeY = 0, eyeZ = 5;
 GLdouble centerX = 0, centerY = 0, centerZ = 0;
 GLdouble upX = 0, upY = 1, upZ = 0;
 
-GLfloat xRotated = 0, yRotated = 0, zRotated = 0;
-GLdouble radius = 0.01;
+GLfloat xRotated = 45, yRotated = 45, zRotated = 45;
 
 GLfloat ballsCoordinates[N * 3];
+
+/*************   DEVICE   **************/
+
+__device__ GLfloat speedTable_C[N * 3];
+__device__ bool collisionMatrix[N * N];
+__device__ int collisionSafetyCounter[N * N];
 
 /*************FUNCTIONS*****************/
 /***************************************/
 void display(void);
 void reshape(int x, int y);
+void Timer(int value);
+
 void initData();
 float getRandomCord();
+float getRandomSpeed();
 
 void drawBackFace();
 void drawFrontFace();
@@ -33,11 +46,18 @@ void drawBottomFace();
 
 void specialKeys(int key, int x, int y);
 
+__global__ void initGpuData(float* speedTable);
+cudaError_t sendDataToGPU();
+__global__ void calculateNewPositions(float* ballsTable, float springiness, float radius);
+cudaError_t sendAndCalculateCordsOnGPU(float* ballTable);
+__device__ int detectCollision(GLfloat x, GLfloat y, GLfloat z, int ballNumber, GLfloat * ballTable);
+
 /************   MAIN   *****************/
 /***************************************/
 int main(int argc, char **argv)
 {
 	initData();
+	sendDataToGPU();
 
 	glutInit(&argc, argv);
 	glutInitWindowSize(1000, 1000);
@@ -46,6 +66,7 @@ int main(int argc, char **argv)
 	glutDisplayFunc(display);
 	glutSpecialFunc(specialKeys);
 	glutReshapeFunc(reshape);
+	glutTimerFunc(0, Timer, 0);
 	glutMainLoop();
 	return 0;
 }
@@ -79,14 +100,14 @@ void display(void)
 		glPushMatrix();
 		// traslate the draw by z = -4.0
 		// Note this when you decrease z like -8.0 the drawing will looks far , or smaller.
-		glTranslatef(ballsCoordinates[i], ballsCoordinates[i+1], ballsCoordinates[i+2]);
+		glTranslatef(ballsCoordinates[i*3], ballsCoordinates[i*3+1], ballsCoordinates[i*3+2]);
 		// Red color used to draw.
 		glColor3f(0.9, 0.3, 0.2);
 		// changing in transformation matrix.
 		
 		glScalef(1.0, 1.0, 1.0);
 		// built-in (glut library) function , draw you a sphere.
-		glutWireSphere(radius, 20, 20);
+		glutWireSphere(RADIUS, 20, 20);
 		glPopMatrix();
 		// Flush buffers to screen
 	}
@@ -122,6 +143,8 @@ void display(void)
 	glFlush();
 	// sawp buffers called because we are using double buffering 
 	// glutSwapBuffers();
+
+	sendAndCalculateCordsOnGPU(ballsCoordinates);
 }
 
 void drawBackFace(){
@@ -170,12 +193,17 @@ void reshape(int x, int y)
 	glViewport(0, 0, x, y);  //Use the whole window for rendering
 } 
 
+void Timer(int value) {
+	glutPostRedisplay();	// Post a paint request to activate display()
+	glutTimerFunc(refreshMillis, Timer, 0); // subsequent timer call at milliseconds
+}
+
 void initData(){
 	for (int i = 0; i < N; i++)
 	{
-		ballsCoordinates[i] = getRandomCord();
-		ballsCoordinates[i + 1] = getRandomCord();
-		ballsCoordinates[i + 2] = getRandomCord();
+		ballsCoordinates[i*3] = getRandomCord();
+		ballsCoordinates[i*3 + 1] = getRandomCord();
+		ballsCoordinates[i*3 + 2] = getRandomCord();
 	}
 }
 
@@ -185,6 +213,214 @@ float getRandomCord()
 	float r = -1.0f + (rand() / (float)RAND_MAX * 2.0f);
 	r = r + (c * 0.000005f);
 	return r;
+}
+
+float getRandomSpeed()
+{
+	int c = rand() % 2;
+	float a = 0.1f;
+	float r = ((rand() / (float)RAND_MAX * a));
+	if (c == 1)
+		r = -r;
+	return r;
+}
+
+__global__ void initGpuData(float* speedTable){
+	for (int i = 0; i < N * 3; i++){
+		speedTable_C[i] = speedTable[i];
+	}
+	for (int i = 0; i < N*N; i++){
+		collisionMatrix[i] = false;
+		collisionSafetyCounter[i] = 0;
+	}
+}
+cudaError_t sendDataToGPU(){
+	float speedTable[3 * N];
+	float* dev_speedTable = 0;
+	cudaError_t cudaStatus;
+
+	for (int i = 0; i < N; i++){
+		speedTable[i * 3] = getRandomSpeed();
+		speedTable[i * 3 + 1] = 0;
+		speedTable[i * 3 + 2] = getRandomSpeed();
+	}
+
+	// Choose which GPU to run on, change this on a multi-GPU system.
+	cudaStatus = cudaSetDevice(0);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&dev_speedTable, 3 * N * sizeof(float));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMemcpy(dev_speedTable, speedTable,3 * N * sizeof(float), cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+	initGpuData << <1, 1 >> >(dev_speedTable);
+
+Error:
+	cudaFree(dev_speedTable);
+
+	return cudaStatus;
+}
+
+__global__ void calculateNewPositions(float* ballsTable){
+	int k = blockIdx.x * blockDim.x + threadIdx.x;
+	while (k < N){
+		if (k < N) {			
+			ballsTable[k * 3] += speedTable_C[k * 3];
+			ballsTable[k * 3 + 1] += speedTable_C[k * 3 + 1];
+			ballsTable[k * 3 + 2] += speedTable_C[k * 3 + 2];
+			// Check if the ball exceeds the edges
+			if (ballsTable[k * 3] > 1.0 - RADIUS){
+				ballsTable[k * 3] = 1.0 - RADIUS;
+				speedTable_C[k * 3] = -speedTable_C[k * 3] * SPRINGINESS;		
+			}
+			if (ballsTable[k * 3] < -1.0 + RADIUS){
+				ballsTable[k * 3] = -1.0 + RADIUS;
+				speedTable_C[k * 3] = -speedTable_C[k * 3] * SPRINGINESS;
+			}
+			if (ballsTable[k * 3 + 1] > 1.0 - RADIUS){
+				ballsTable[k * 3 + 1] = 1.0 - RADIUS;
+				speedTable_C[k * 3 + 1] = -speedTable_C[k * 3 + 1] * SPRINGINESS;
+			}
+			if (ballsTable[k * 3 + 1] < -1.0 + RADIUS){
+				ballsTable[k * 3 + 1] = -1.0 + RADIUS;
+				speedTable_C[k * 3 + 1] = -speedTable_C[k * 3 + 1] * SPRINGINESS;
+			}			
+
+			if (ballsTable[k * 3 + 2] > 1.0 - RADIUS){
+				ballsTable[k * 3 + 2] = 1.0 - RADIUS;
+				speedTable_C[k * 3 + 2] = -speedTable_C[k * 3 + 2] * SPRINGINESS;
+			}
+			if (ballsTable[k * 3 + 2] < -1.0 + RADIUS){
+				ballsTable[k * 3 + 2] = -1.0 + RADIUS;
+				speedTable_C[k * 3 + 2] = -speedTable_C[k * 3 + 2] * SPRINGINESS;
+			}
+
+			int ballDetected = detectCollision(ballsTable[k * 3], ballsTable[k * 3 + 1], ballsTable[k * 3 + 2], k, ballsTable);
+
+			if (ballDetected != -1){
+				float tmpSpeedX = ballsTable[k * 3];
+				float tmpSpeedY = ballsTable[k * 3 + 1];
+				float tmpSpeedZ = ballsTable[k * 3 + 2];
+				ballsTable[k * 3] = ballsTable[ballDetected * 3];
+				ballsTable[k * 3 + 1] = ballsTable[ballDetected * 3 + 1];
+				ballsTable[k * 3 + 2] = ballsTable[ballDetected * 3 + 2];
+				ballsTable[ballDetected * 3] = tmpSpeedX;
+				ballsTable[ballDetected * 3 + 1] = tmpSpeedY;
+				ballsTable[ballDetected * 3 + 2] = tmpSpeedZ;
+			}
+			//FRICTION
+			if ((ballsTable[k * 3 + 1] < -1.0 + RADIUS + 0.0003) && (speedTable_C[k * 3 + 1] < 0.02)){
+				speedTable_C[k * 3] *= 0.98;
+				speedTable_C[k * 3 + 2] *= 0.98;
+			}
+			//gravity
+			
+			speedTable_C[k*3+1] -= GRAVITY;
+			//tmpSpeedTableY[k] -= 0.01f;
+		}
+		k += blockDim.x * gridDim.x;
+	}
+}
+cudaError_t sendAndCalculateCordsOnGPU(float* ballTable)
+{
+	float* dev_ballTable = 0;
+	cudaError_t cudaStatus;
+
+	// Choose which GPU to run on, change this on a multi-GPU system.
+	cudaStatus = cudaSetDevice(0);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+		goto Error;
+	}
+	cudaStatus = cudaMalloc((void**)&dev_ballTable, 3 * N * sizeof(float));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+	cudaStatus = cudaMemcpy(dev_ballTable , ballTable, 3 * N * sizeof(float), cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+	calculateNewPositions << <100, 1000 >> >(dev_ballTable);
+
+	// Check for any errors launching the kernel
+	cudaStatus = cudaGetLastError();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+		goto Error;
+	}
+
+	// cudaDeviceSynchronize waits for the kernel to finish, and returns
+	// any errors encountered during the launch.
+	cudaStatus = cudaDeviceSynchronize();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
+		goto Error;
+	}
+	// Copy output vector from GPU buffer to host memory.
+	cudaStatus = cudaMemcpy(ballTable, dev_ballTable, 3 * N * sizeof(float), cudaMemcpyDeviceToHost);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+	Error:
+		cudaFree(dev_ballTable);
+
+	return cudaStatus;
+}
+
+__device__ int detectCollision(GLfloat x, GLfloat y, GLfloat z, int ballNumber, GLfloat * ballTable){
+	int collisionBall = -1;
+	int num = ballNumber;
+	for (int i = 0; i < N; i++){
+		if (i != ballNumber){
+			/*local*/
+			GLfloat secondBallX = ballTable[i * 3];
+			GLfloat secondBallY = ballTable[i * 3 + 1];
+			GLfloat secondBallZ = ballTable[i * 3 + 2];
+			GLfloat firstBallX = ballTable[ballNumber * 3];
+			GLfloat firstBallY = ballTable[ballNumber * 3 + 1];
+			GLfloat firstBallZ = ballTable[ballNumber * 3 + 2];
+			GLfloat leftSide = (2 * RADIUS)*(2 * RADIUS);
+			GLfloat rightSide = ((firstBallX - secondBallX)*(firstBallX - secondBallX) + (firstBallY - secondBallY)*(firstBallY - secondBallY)) + (firstBallZ - secondBallZ)*(firstBallZ - secondBallZ);
+			/**/
+			if (leftSide > rightSide)
+			{
+				//collisionBall = ballsMatrix[coordinateX + i][coordinateY + j];
+				if (collisionMatrix[ballNumber + i*N] == false){
+					collisionMatrix[ballNumber + i*N] = true;
+					collisionMatrix[i + N * ballNumber] = true;
+					collisionSafetyCounter[ballNumber + i*N] = 2;
+					collisionSafetyCounter[i + N * ballNumber] = 2;
+					return i;
+				}
+			}
+			else{
+				if (collisionSafetyCounter[ballNumber + i*N] > 0){
+					collisionSafetyCounter[ballNumber + i*N] --;
+					collisionSafetyCounter[i + N * ballNumber] --;
+				}
+				else{
+					collisionMatrix[ballNumber + N * i] = false;
+					collisionMatrix[i + N * ballNumber] = false;
+				}
+			}
+		}
+	}
+	return -1;
 }
 
 void specialKeys(int key, int x, int y) {
@@ -213,7 +449,7 @@ void specialKeys(int key, int x, int y) {
 	}
 
 	//  Request display update
-	glutPostRedisplay();
+	//glutPostRedisplay();
 
 }
 
