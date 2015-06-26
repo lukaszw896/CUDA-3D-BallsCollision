@@ -1,4 +1,4 @@
-
+#include <windows.h> 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include <stdio.h>
@@ -7,12 +7,21 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-#define N  2000
+
+
+#define N  10
 #define GRAVITY 0.01
 #define SPRINGINESS 0.95
-#define RADIUS 0.01
+#define RADIUS 0.08
 
+bool isCalculatedOnGPU = true;
+float colorStep = 1.0 / N;
+
+int drawCallsCount = 0;
+int measureCount = 1;
+float timeSum = 0;
 int refreshMillis = 35;
+
 
 GLdouble eyeX = 0, eyeY = 0, eyeZ = 5;
 GLdouble centerX = 0, centerY = 0, centerZ = 0;
@@ -21,6 +30,11 @@ GLdouble upX = 0, upY = 1, upZ = 0;
 GLfloat xRotated = 45, yRotated = 45, zRotated = 45;
 
 GLfloat ballsCoordinates[N * 3];
+/*************    HOST   **************/
+
+GLfloat speedTable_H[N * 3];
+bool collisionMatrix_H[N * N];
+int collisionSafetyCounter_H[N * N];
 
 /*************   DEVICE   **************/
 
@@ -37,12 +51,16 @@ void Timer(int value);
 void initData();
 float getRandomCord();
 float getRandomSpeed();
+double second();
 
 void drawBackFace();
 void drawFrontFace();
 void drawLeftFace();
 void drawRightFace();
 void drawBottomFace();
+
+void calculateNewPositionsCPU(float* ballsTable);
+int detectCollisionCPU(GLfloat x, GLfloat y, GLfloat z, int ballNumber, GLfloat * ballTable);
 
 void specialKeys(int key, int x, int y);
 
@@ -61,7 +79,7 @@ int main(int argc, char **argv)
 
 	glutInit(&argc, argv);
 	glutInitWindowSize(1000, 1000);
-	glutCreateWindow("Solid Sphere");
+	glutCreateWindow("3DBalls");
 	glEnable(GL_DEPTH_TEST);
 	glutDisplayFunc(display);
 	glutSpecialFunc(specialKeys);
@@ -102,7 +120,7 @@ void display(void)
 		// Note this when you decrease z like -8.0 the drawing will looks far , or smaller.
 		glTranslatef(ballsCoordinates[i*3], ballsCoordinates[i*3+1], ballsCoordinates[i*3+2]);
 		// Red color used to draw.
-		glColor3f(0.9, 0.3, 0.2);
+		glColor3f(0.9, colorStep*i, 0.2);
 		// changing in transformation matrix.
 		
 		glScalef(1.0, 1.0, 1.0);
@@ -144,7 +162,44 @@ void display(void)
 	// sawp buffers called because we are using double buffering 
 	// glutSwapBuffers();
 
-	sendAndCalculateCordsOnGPU(ballsCoordinates);
+	if (isCalculatedOnGPU){
+		drawCallsCount++;
+		cudaEvent_t start, stop;
+		float time;
+		cudaEventCreate(&start);
+		cudaEventCreate(&stop);
+		cudaEventRecord(start, 0);
+		cudaError_t cudaStatus = sendAndCalculateCordsOnGPU(ballsCoordinates);
+		cudaEventRecord(stop, 0);
+		cudaEventSynchronize(stop);
+
+		cudaEventElapsedTime(&time, start, stop);
+		timeSum += time;
+		if (drawCallsCount == 100)
+		{
+			printf("Average fps %f . Draw calls count: %d \n", (float)(1000 / (timeSum / 100)), (measureCount * 100));
+			drawCallsCount = 0;
+			measureCount++;
+			timeSum = 0;
+		}
+	}
+	else{
+		drawCallsCount++;
+		float hostTime;
+		double startTime, stopTime, elapsed;
+		startTime = second();
+		calculateNewPositionsCPU(ballsCoordinates);
+		stopTime = second();
+		hostTime = (stopTime - startTime) * 1000;
+		timeSum += hostTime;
+		if (drawCallsCount == 100)
+		{
+			printf("Average fps %f . Draw calls count: %d \n", (float)(1000 / (timeSum / 100)), (measureCount * 100));
+			drawCallsCount = 0;
+			measureCount++;
+			timeSum = 0;
+		}
+	}
 }
 
 void drawBackFace(){
@@ -205,6 +260,14 @@ void initData(){
 		ballsCoordinates[i*3 + 1] = getRandomCord();
 		ballsCoordinates[i*3 + 2] = getRandomCord();
 	}
+	/*for (int i = 0; i < N * 3; i++){
+		speedTable_C[i] = speedTable_H[i];
+	}*/
+	for (int i = 0; i < N; i++){
+		speedTable_H[i * 3] = getRandomSpeed();
+		speedTable_H[i * 3 + 1] = 0;
+		speedTable_H[i * 3 + 2] = getRandomSpeed();
+	}
 }
 
 float getRandomCord()
@@ -223,6 +286,25 @@ float getRandomSpeed()
 	if (c == 1)
 		r = -r;
 	return r;
+}
+double second()
+{
+	LARGE_INTEGER t;
+	static double oofreq;
+	static int checkedForHighResTimer;
+	static BOOL hasHighResTimer;
+	if (!checkedForHighResTimer) {
+		hasHighResTimer = QueryPerformanceFrequency(&t);
+		oofreq = 1.0 / (double)t.QuadPart;
+		checkedForHighResTimer = 1;
+	}
+	if (hasHighResTimer) {
+		QueryPerformanceCounter(&t);
+		return (double)t.QuadPart * oofreq;
+	}
+	else {
+		return (double)GetTickCount() / 1000.0;
+	}
 }
 
 __global__ void initGpuData(float* speedTable){
@@ -309,15 +391,15 @@ __global__ void calculateNewPositions(float* ballsTable){
 			int ballDetected = detectCollision(ballsTable[k * 3], ballsTable[k * 3 + 1], ballsTable[k * 3 + 2], k, ballsTable);
 
 			if (ballDetected != -1){
-				float tmpSpeedX = ballsTable[k * 3];
-				float tmpSpeedY = ballsTable[k * 3 + 1];
-				float tmpSpeedZ = ballsTable[k * 3 + 2];
-				ballsTable[k * 3] = ballsTable[ballDetected * 3];
-				ballsTable[k * 3 + 1] = ballsTable[ballDetected * 3 + 1];
-				ballsTable[k * 3 + 2] = ballsTable[ballDetected * 3 + 2];
-				ballsTable[ballDetected * 3] = tmpSpeedX;
-				ballsTable[ballDetected * 3 + 1] = tmpSpeedY;
-				ballsTable[ballDetected * 3 + 2] = tmpSpeedZ;
+				float tmpSpeedX = speedTable_C[k * 3];
+				float tmpSpeedY = speedTable_C[k * 3 + 1];
+				float tmpSpeedZ = speedTable_C[k * 3 + 2];
+				speedTable_C[k * 3] = speedTable_C[ballDetected * 3];
+				speedTable_C[k * 3 + 1] = speedTable_C[ballDetected * 3 + 1];
+				speedTable_C[k * 3 + 2] = speedTable_C[ballDetected * 3 + 2];
+				speedTable_C[ballDetected * 3] = tmpSpeedX;
+				speedTable_C[ballDetected * 3 + 1] = tmpSpeedY;
+				speedTable_C[ballDetected * 3 + 2] = tmpSpeedZ;
 			}
 			//FRICTION
 			if ((ballsTable[k * 3 + 1] < -1.0 + RADIUS + 0.0003) && (speedTable_C[k * 3 + 1] < 0.02)){
@@ -416,6 +498,107 @@ __device__ int detectCollision(GLfloat x, GLfloat y, GLfloat z, int ballNumber, 
 				else{
 					collisionMatrix[ballNumber + N * i] = false;
 					collisionMatrix[i + N * ballNumber] = false;
+				}
+			}
+		}
+	}
+	return -1;
+}
+
+
+
+/*********		CPU calculations		**************/
+void calculateNewPositionsCPU(float* ballsTable){
+	for(int k=0;k<N;k++){
+			ballsTable[k * 3] += speedTable_H[k * 3];
+			ballsTable[k * 3 + 1] += speedTable_H[k * 3 + 1];
+			ballsTable[k * 3 + 2] += speedTable_H[k * 3 + 2];
+			// Check if the ball exceeds the edges
+			if (ballsTable[k * 3] > 1.0 - RADIUS){
+				ballsTable[k * 3] = 1.0 - RADIUS;
+				speedTable_H[k * 3] = -speedTable_H[k * 3] * SPRINGINESS;
+			}
+			if (ballsTable[k * 3] < -1.0 + RADIUS){
+				ballsTable[k * 3] = -1.0 + RADIUS;
+				speedTable_H[k * 3] = -speedTable_H[k * 3] * SPRINGINESS;
+			}
+			if (ballsTable[k * 3 + 1] > 1.0 - RADIUS){
+				ballsTable[k * 3 + 1] = 1.0 - RADIUS;
+				speedTable_H[k * 3 + 1] = -speedTable_H[k * 3 + 1] * SPRINGINESS;
+			}
+			if (ballsTable[k * 3 + 1] < -1.0 + RADIUS){
+				ballsTable[k * 3 + 1] = -1.0 + RADIUS;
+				speedTable_H[k * 3 + 1] = -speedTable_H[k * 3 + 1] * SPRINGINESS;
+			}
+
+			if (ballsTable[k * 3 + 2] > 1.0 - RADIUS){
+				ballsTable[k * 3 + 2] = 1.0 - RADIUS;
+				speedTable_H[k * 3 + 2] = -speedTable_H[k * 3 + 2] * SPRINGINESS;
+			}
+			if (ballsTable[k * 3 + 2] < -1.0 + RADIUS){
+				ballsTable[k * 3 + 2] = -1.0 + RADIUS;
+				speedTable_H[k * 3 + 2] = -speedTable_H[k * 3 + 2] * SPRINGINESS;
+			}
+
+			int ballDetected = detectCollisionCPU(ballsTable[k * 3], ballsTable[k * 3 + 1], ballsTable[k * 3 + 2], k, ballsTable);
+
+			if (ballDetected != -1){
+				float tmpSpeedX = speedTable_H[k * 3];
+				float tmpSpeedY = speedTable_H[k * 3 + 1];
+				float tmpSpeedZ = speedTable_H[k * 3 + 2];
+				speedTable_H[k * 3] = speedTable_H[ballDetected * 3];
+				speedTable_H[k * 3 + 1] = speedTable_H[ballDetected * 3 + 1];
+				speedTable_H[k * 3 + 2] = speedTable_H[ballDetected * 3 + 2];
+				speedTable_H[ballDetected * 3] = tmpSpeedX;
+				speedTable_H[ballDetected * 3 + 1] = tmpSpeedY;
+				speedTable_H[ballDetected * 3 + 2] = tmpSpeedZ;
+			}
+			//FRICTION
+			if ((ballsTable[k * 3 + 1] < -1.0 + RADIUS + 0.0003) && (speedTable_H[k * 3 + 1] < 0.02)){
+				speedTable_H[k * 3] *= 0.98;
+				speedTable_H[k * 3 + 2] *= 0.98;
+			}
+			//gravity
+
+			speedTable_H[k * 3 + 1] -= GRAVITY;
+			//tmpSpeedTableY[k] -= 0.01f;
+		}
+}
+
+int detectCollisionCPU(GLfloat x, GLfloat y, GLfloat z, int ballNumber, GLfloat * ballTable){
+	int collisionBall = -1;
+	int num = ballNumber;
+	for (int i = 0; i < N; i++){
+		if (i != ballNumber){
+			/*local*/
+			GLfloat secondBallX = ballTable[i * 3];
+			GLfloat secondBallY = ballTable[i * 3 + 1];
+			GLfloat secondBallZ = ballTable[i * 3 + 2];
+			GLfloat firstBallX = ballTable[ballNumber * 3];
+			GLfloat firstBallY = ballTable[ballNumber * 3 + 1];
+			GLfloat firstBallZ = ballTable[ballNumber * 3 + 2];
+			GLfloat leftSide = (2 * RADIUS)*(2 * RADIUS);
+			GLfloat rightSide = ((firstBallX - secondBallX)*(firstBallX - secondBallX) + (firstBallY - secondBallY)*(firstBallY - secondBallY)) + (firstBallZ - secondBallZ)*(firstBallZ - secondBallZ);
+			/**/
+			if (leftSide > rightSide)
+			{
+				//collisionBall = ballsMatrix[coordinateX + i][coordinateY + j];
+				if (collisionMatrix_H[ballNumber + i*N] == false){
+					collisionMatrix_H[ballNumber + i*N] = true;
+					collisionMatrix_H[i + N * ballNumber] = true;
+					collisionSafetyCounter_H[ballNumber + i*N] = 2;
+					collisionSafetyCounter_H[i + N * ballNumber] = 2;
+					return i;
+				}
+			}
+			else{
+				if (collisionSafetyCounter_H[ballNumber + i*N] > 0){
+					collisionSafetyCounter_H[ballNumber + i*N] --;
+					collisionSafetyCounter_H[i + N * ballNumber] --;
+				}
+				else{
+					collisionMatrix_H[ballNumber + N * i] = false;
+					collisionMatrix_H[i + N * ballNumber] = false;
 				}
 			}
 		}
