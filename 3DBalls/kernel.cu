@@ -9,7 +9,7 @@
 
 
 
-#define N  10
+#define N  400
 #define GRAVITY 0.01
 #define SPRINGINESS 0.95
 #define RADIUS 0.08
