@@ -9,10 +9,10 @@
 
 
 
-#define N  400
+#define N  1000
 #define GRAVITY 0.01
 #define SPRINGINESS 0.95
-#define RADIUS 0.08
+#define RADIUS 0.01
 
 bool isCalculatedOnGPU = true;
 float colorStep = 1.0 / N;
